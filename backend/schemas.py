@@ -6,7 +6,7 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str
-    role: str = "staff"
+    role: str = "staff"  # root_admin, tenant_admin, staff, customer
     
     @field_validator('password')
     @classmethod
@@ -36,6 +36,7 @@ class UserResponse(UserBase):
 class Token(BaseModel):
     access_token: str
     token_type: str
+    role: Optional[str] = None  # User role for convenience
 
 class TokenData(BaseModel):
     username: Optional[str] = None
@@ -90,6 +91,110 @@ class LedgerResponse(BaseModel):
     balance: int
     transaction_type: str
     timestamp: str
+
+    class Config:
+        from_attributes = True
+
+# State Schemas
+class StateBase(BaseModel):
+    name: str  # e.g., "Maharashtra"
+    code: str  # e.g., "MH" (2-letter code)
+    gst_code: Optional[str] = None  # First 2 digits of GST number (e.g., "27" for Maharashtra)
+
+class StateCreate(StateBase):
+    pass
+
+class StateResponse(StateBase):
+    id: int
+    is_active: bool
+    created_at: str
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+# Shop and Owner Schemas
+class ShopBase(BaseModel):
+    shop_name: str
+    password: str  # Password for shop authentication
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state_id: Optional[int] = None  # Foreign key to State model
+    state: Optional[str] = None  # Deprecated: kept for backward compatibility
+    pincode: Optional[str] = None
+    gst_number: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    email_password: Optional[str] = None  # Password for email account (will be encrypted)
+
+class OwnerBase(BaseModel):
+    owner_name: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    aadhaar_number: Optional[str] = None
+    pan_number: Optional[str] = None
+    address: Optional[str] = None
+
+class ShopOnboardRequest(BaseModel):
+    shop: ShopBase
+    owner: OwnerBase
+
+class ShopResponse(BaseModel):
+    id: int
+    shop_name: str
+    shop_code: str
+    api_key: str
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state_id: Optional[int] = None  # Foreign key to State
+    state: Optional[str] = None  # Deprecated: kept for backward compatibility
+    state_name: Optional[str] = None  # State name from relationship
+    state_code: Optional[str] = None  # State code from relationship
+    pincode: Optional[str] = None
+    gst_number: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    is_active: bool
+    created_at: str
+    # Note: password and email_password are not included in response for security
+
+    class Config:
+        from_attributes = True
+
+class OwnerResponse(BaseModel):
+    id: int
+    shop_id: int
+    owner_name: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    aadhaar_number: Optional[str] = None
+    pan_number: Optional[str] = None
+    address: Optional[str] = None
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+class ShopOnboardResponse(BaseModel):
+    shop: ShopResponse
+    owner: OwnerResponse
+    message: str
+
+# Customer Schemas
+class CustomerBase(BaseModel):
+    customer_name: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    address: Optional[str] = None
+
+class CustomerCreate(CustomerBase):
+    pass
+
+class CustomerResponse(CustomerBase):
+    id: int
+    shop_id: int
+    is_active: bool
+    created_at: str
 
     class Config:
         from_attributes = True

@@ -1,11 +1,12 @@
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi import Depends, HTTPException, status, Header, Security
+from fastapi.security import OAuth2PasswordBearer, APIKeyHeader
 from sqlalchemy.orm import Session
 import hashlib
 import bcrypt
+import secrets
 import schemas, models, database, crud
 
 # SECRET_KEY should be in env/config for prod, hardcoded for task
@@ -13,7 +14,61 @@ SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def generate_api_key() -> str:
+    """Generate a secure random API key"""
+    return f"kf_{secrets.token_urlsafe(32)}"
+
+def generate_shop_code(shop_name: str) -> str:
+    """Generate a unique shop code from shop name"""
+    # Convert to uppercase, remove spaces, take first 6 chars
+    base_code = shop_name.upper().replace(" ", "")[:6]
+    # Add random suffix for uniqueness
+    suffix = secrets.token_hex(2).upper()
+    return f"{base_code}{suffix}"
+
+def get_shop_by_api_key(db: Session, api_key: str) -> Optional[models.Shop]:
+    """Get shop by API key"""
+    return db.query(models.Shop).filter(models.Shop.api_key == api_key, models.Shop.is_active == True).first()
+
+def get_shop_by_code(db: Session, shop_code: str) -> Optional[models.Shop]:
+    """Get shop by shop_code"""
+    return db.query(models.Shop).filter(models.Shop.shop_code == shop_code, models.Shop.is_active == True).first()
+
+def authenticate_shop(db: Session, shop_code: str, password: str) -> Optional[models.Shop]:
+    """Authenticate shop using shop_code and password"""
+    shop = get_shop_by_code(db, shop_code)
+    if not shop:
+        return None
+    if not verify_password(password, shop.hashed_password):
+        return None
+    return shop
+
+def get_db():
+    """Database dependency for auth functions"""
+    db = database.SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def verify_api_key(api_key: Optional[str] = Header(None, alias="X-API-Key"), db: Session = Depends(get_db)) -> models.Shop:
+    """Verify API key and return shop"""
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key required. Please provide X-API-Key header."
+        )
+    
+    shop = get_shop_by_api_key(db, api_key)
+    if not shop:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or inactive API key"
+        )
+    return shop
 
 def get_password_hash(password):
     """
@@ -80,4 +135,56 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 def get_current_active_user(current_user: models.User = Depends(get_current_user)):
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+def get_current_user_optional(token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(database.SessionLocal)) -> Optional[models.User]:
+    """Get current user if authenticated, otherwise return None (for optional auth endpoints)"""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return None
+        user = crud.get_user_by_username(db, username=username)
+        return user if user and user.is_active else None
+    except (JWTError, Exception):
+        return None
+
+# Role-based access control functions
+def require_root_admin(current_user: models.User = Depends(get_current_active_user)):
+    """Require root_admin role - can manage all tenants"""
+    if current_user.role != "root_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Root admin access required"
+        )
+    return current_user
+
+def require_tenant_admin(current_user: models.User = Depends(get_current_active_user)):
+    """Require tenant_admin role - can manage their own shop"""
+    if current_user.role != "tenant_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant admin access required"
+        )
+    if not current_user.shop_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User is not linked to a shop"
+        )
+    return current_user
+
+def require_tenant_admin_or_staff(current_user: models.User = Depends(get_current_active_user)):
+    """Require tenant_admin or staff role - can access shop resources"""
+    if current_user.role not in ["tenant_admin", "staff"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant admin or staff access required"
+        )
+    if not current_user.shop_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User is not linked to a shop"
+        )
     return current_user

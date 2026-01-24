@@ -1,4 +1,7 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text
+from sqlalchemy import Column, Integer, String, Boolean, Text, ForeignKey, DateTime
+from sqlalchemy.orm import relationship
+from datetime import datetime
+import secrets
 from database import Base
 
 class User(Base):
@@ -7,9 +10,13 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(Text)  # Changed to Text for future-proofing (bcrypt hashes are 60 chars, but allows for algorithm changes)
-    role = Column(String, default="staff") # admin, staff
-    tenant_id = Column(String, index=True, nullable=True) # For multi-tenancy later
+    role = Column(String, default="staff") # root_admin, tenant_admin, staff, customer
+    tenant_id = Column(String, index=True, nullable=True) # For multi-tenancy later (deprecated, use shop_id)
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=True, index=True)  # Link to shop
     is_active = Column(Boolean, default=True)
+    
+    # Relationships
+    shop = relationship("Shop", back_populates="users")
 
 class Item(Base):
     __tablename__ = "items"
@@ -27,7 +34,12 @@ class Item(Base):
     bulk_qty = Column(Integer, default=0) # Number of Parent Units
     loose_qty = Column(Integer, default=0) # Number of Child Units
     
-    tenant_id = Column(String, index=True, nullable=True)
+    # Multi-tenancy
+    tenant_id = Column(String, index=True, nullable=True) # Deprecated, use shop_id
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=True, index=True)  # Link to shop
+    
+    # Relationships
+    shop = relationship("Shop", back_populates="items")
 
 class StockAdjustment(Base):
     __tablename__ = "stock_adjustments"
@@ -38,7 +50,8 @@ class StockAdjustment(Base):
     quantity_change_bulk = Column(Integer, default=0)
     quantity_change_loose = Column(Integer, default=0)
     timestamp = Column(String) # Store isoformat datetime
-    tenant_id = Column(String, index=True, nullable=True)
+    tenant_id = Column(String, index=True, nullable=True) # Deprecated, use shop_id
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=True, index=True)  # Link to shop
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
@@ -59,7 +72,11 @@ class Invoice(Base):
     tax_amount = Column(Integer)
     status = Column(String, default="PAID") # PAID, CREDIT
     timestamp = Column(String)
-    tenant_id = Column(String, index=True, nullable=True)
+    tenant_id = Column(String, index=True, nullable=True) # Deprecated, use shop_id
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=True, index=True)  # Link to shop
+    
+    # Relationships
+    shop = relationship("Shop", back_populates="invoices")
 
 class InvoiceItem(Base):
     __tablename__ = "invoice_items"
@@ -70,7 +87,8 @@ class InvoiceItem(Base):
     quantity = Column(Integer)
     unit_price = Column(Integer)
     total_price = Column(Integer)
-    tenant_id = Column(String, index=True, nullable=True)
+    tenant_id = Column(String, index=True, nullable=True) # Deprecated, use shop_id
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=True, index=True)  # Link to shop
 
 class Ledger(Base):
     __tablename__ = "ledgers"
@@ -83,4 +101,81 @@ class Ledger(Base):
     transaction_type = Column(String) # INVOICE, PAYMENT
     reference_id = Column(String) # Invoice ID or Payment Ref
     timestamp = Column(String)
-    tenant_id = Column(String, index=True, nullable=True)
+    tenant_id = Column(String, index=True, nullable=True) # Deprecated, use shop_id
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=True, index=True)  # Link to shop
+
+class State(Base):
+    __tablename__ = "states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True, nullable=False)  # e.g., "Maharashtra"
+    code = Column(String, unique=True, index=True, nullable=False)  # e.g., "MH" (2-letter code)
+    gst_code = Column(String, nullable=True)  # First 2 digits of GST number (e.g., "27" for Maharashtra)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    updated_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    
+    # Relationships
+    shops = relationship("Shop", back_populates="state_rel")
+
+class Shop(Base):
+    __tablename__ = "shops"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shop_name = Column(String, index=True, nullable=False)
+    shop_code = Column(String, unique=True, index=True, nullable=False)  # Unique identifier for shop
+    api_key = Column(String, unique=True, index=True, nullable=False)  # API key for authentication
+    hashed_password = Column(Text, nullable=False)  # Password for shop authentication
+    address = Column(Text, nullable=True)
+    city = Column(String, nullable=True)
+    state_id = Column(Integer, ForeignKey("states.id"), nullable=True, index=True)  # Foreign key to State
+    state = Column(String, nullable=True)  # Deprecated: kept for backward compatibility during migration
+    pincode = Column(String, nullable=True)
+    gst_number = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    email_password = Column(Text, nullable=True)  # Encrypted password for email account
+    is_active = Column(Boolean, default=True)
+    created_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    updated_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    
+    # Relationships
+    state_rel = relationship("State", back_populates="shops")
+    owner = relationship("Owner", back_populates="shop", uselist=False)
+    users = relationship("User", back_populates="shop")
+    customers = relationship("Customer", back_populates="shop")
+    items = relationship("Item", back_populates="shop")
+    invoices = relationship("Invoice", back_populates="shop")
+
+class Owner(Base):
+    __tablename__ = "owners"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=False, unique=True)
+    owner_name = Column(String, nullable=False)
+    phone = Column(String, index=True, nullable=True)
+    email = Column(String, nullable=True)
+    aadhaar_number = Column(String, nullable=True)
+    pan_number = Column(String, nullable=True)
+    address = Column(Text, nullable=True)
+    created_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    updated_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    
+    # Relationships
+    shop = relationship("Shop", back_populates="owner")
+
+class Customer(Base):
+    __tablename__ = "customers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=False, index=True)  # Link to shop/tenant
+    customer_name = Column(String, nullable=False, index=True)
+    phone = Column(String, index=True, nullable=True)
+    email = Column(String, nullable=True)
+    address = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    updated_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    
+    # Relationships
+    shop = relationship("Shop", back_populates="customers")
