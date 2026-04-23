@@ -116,9 +116,11 @@ class StateResponse(StateBase):
 # Shop and Owner Schemas
 class ShopBase(BaseModel):
     shop_name: str
-    password: str  # Password for shop authentication
+    password: Optional[str] = None  # Optional for admin-created stores; defaults are applied
     address: Optional[str] = None
     city: Optional[str] = None
+    parent_shop_id: Optional[int] = None
+    store_type: str = "main"  # main or branch
     state_id: Optional[int] = None  # Foreign key to State model
     state: Optional[str] = None  # Deprecated: kept for backward compatibility
     pincode: Optional[str] = None
@@ -146,6 +148,8 @@ class ShopResponse(BaseModel):
     api_key: str
     address: Optional[str] = None
     city: Optional[str] = None
+    parent_shop_id: Optional[int] = None
+    store_type: str = "main"
     state_id: Optional[int] = None  # Foreign key to State
     state: Optional[str] = None  # Deprecated: kept for backward compatibility
     state_name: Optional[str] = None  # State name from relationship
@@ -178,7 +182,22 @@ class OwnerResponse(BaseModel):
 class ShopOnboardResponse(BaseModel):
     shop: ShopResponse
     owner: OwnerResponse
+    shop_id: int  # Explicitly include shop_id for convenience
     message: str
+
+class ShopAdminUpdate(BaseModel):
+    shop_name: Optional[str] = None
+    password: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    parent_shop_id: Optional[int] = None
+    store_type: Optional[str] = None
+    state_id: Optional[int] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+    gst_number: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
 
 # Customer Schemas
 class CustomerBase(BaseModel):

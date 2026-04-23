@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
 import models, schemas, crud, auth, database
-from sqlalchemy import text, event
+from sqlalchemy import text, event, func
 
 # Create all tables - using database.Base which is the same Base used by all models
 database.Base.metadata.create_all(bind=database.engine, checkfirst=True)
@@ -51,6 +51,8 @@ def migrate_tables_if_needed():
                             hashed_password TEXT NOT NULL,
                             address TEXT,
                             city VARCHAR,
+                            parent_shop_id INTEGER,
+                            store_type VARCHAR DEFAULT 'main',
                             state VARCHAR,
                             pincode VARCHAR,
                             gst_number VARCHAR,
@@ -76,10 +78,10 @@ def migrate_tables_if_needed():
                             conn.execute(text("""
                                 INSERT INTO shops (
                                     id, shop_name, shop_code, api_key, hashed_password,
-                                    address, city, state, pincode, gst_number,
+                                    address, city, parent_shop_id, store_type, state, pincode, gst_number,
                                     phone, email, email_password, is_active, created_at, updated_at
                                 ) VALUES (:id, :shop_name, :shop_code, :api_key, :hashed_password,
-                                    :address, :city, :state, :pincode, :gst_number,
+                                    :address, :city, :parent_shop_id, :store_type, :state, :pincode, :gst_number,
                                     :phone, :email, :email_password, :is_active, :created_at, :updated_at)
                             """), {
                                 'id': row_dict.get('id'),
@@ -89,6 +91,8 @@ def migrate_tables_if_needed():
                                 'hashed_password': default_hash,
                                 'address': row_dict.get('address'),
                                 'city': row_dict.get('city'),
+                                'parent_shop_id': row_dict.get('parent_shop_id'),
+                                'store_type': row_dict.get('store_type', 'main'),
                                 'state': row_dict.get('state'),
                                 'pincode': row_dict.get('pincode'),
                                 'gst_number': row_dict.get('gst_number'),
@@ -104,6 +108,7 @@ def migrate_tables_if_needed():
                     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_shops_shop_name ON shops (shop_name)"))
                     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_shops_shop_code ON shops (shop_code)"))
                     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_shops_api_key ON shops (api_key)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_shops_parent_shop_id ON shops (parent_shop_id)"))
                     
                     print("Shops table migration completed!")
             
@@ -361,6 +366,15 @@ def migrate_tables_if_needed():
                             })
                     
                     print("Shops table migration completed with state_id!")
+
+                if 'parent_shop_id' not in column_names:
+                    print("Auto-migrating: Adding parent_shop_id to shops table...")
+                    conn.execute(text("ALTER TABLE shops ADD COLUMN parent_shop_id INTEGER"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_shops_parent_shop_id ON shops (parent_shop_id)"))
+                if 'store_type' not in column_names:
+                    print("Auto-migrating: Adding store_type to shops table...")
+                    conn.execute(text("ALTER TABLE shops ADD COLUMN store_type VARCHAR DEFAULT 'main'"))
+                    conn.execute(text("UPDATE shops SET store_type = 'main' WHERE store_type IS NULL OR store_type = ''"))
             
             # Re-enable foreign key checks
             conn.execute(text("PRAGMA foreign_keys=ON"))
@@ -410,7 +424,7 @@ def create_default_admin_if_needed():
                     db.commit()
                     db.refresh(db_user)
                     
-                    print(f"✅ Default admin user created successfully!")
+                    print("[AUTH] Default admin user created successfully!")
                     print(f"   Username: {db_user.username}")
                     print(f"   Role: {db_user.role}")
                     print(f"   ID: {db_user.id}")
@@ -422,7 +436,7 @@ def create_default_admin_if_needed():
         finally:
             db.close()
     except Exception as e:
-        print(f"❌ ERROR: Could not create default admin user: {e}")
+        print(f"[AUTH] ERROR: Could not create default admin user: {e}")
         import traceback
         traceback.print_exc()
 
@@ -437,14 +451,10 @@ async def startup_event():
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:*",
-        "http://127.0.0.1:*",
-        "http://localhost",
-        "http://127.0.0.1",
-        "*"  # Allow all origins in development (restrict in production)
-    ],
-    allow_credentials=True,
+    # Dev mode: allow Flutter web app from any localhost port.
+    # We use Authorization header (JWT), not cookies, so credentials are not needed.
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],  # Allow all HTTP methods
     allow_headers=["*"],  # Allow all headers
 )
@@ -455,6 +465,36 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def build_shop_response(db: Session, shop: models.Shop) -> schemas.ShopResponse:
+    """Build ShopResponse with computed state details."""
+    state_name = None
+    state_code = None
+    if shop.state_id:
+        state_obj = crud.get_state_by_id(db, shop.state_id)
+        if state_obj:
+            state_name = state_obj.name
+            state_code = state_obj.code
+    return schemas.ShopResponse(
+        id=shop.id,
+        shop_name=shop.shop_name,
+        shop_code=shop.shop_code,
+        api_key=shop.api_key,
+        address=shop.address,
+        city=shop.city,
+        parent_shop_id=shop.parent_shop_id,
+        store_type=shop.store_type or "main",
+        state_id=shop.state_id,
+        state=shop.state,
+        state_name=state_name,
+        state_code=state_code,
+        pincode=shop.pincode,
+        gst_number=shop.gst_number,
+        phone=shop.phone,
+        email=shop.email,
+        is_active=shop.is_active,
+        created_at=shop.created_at,
+    )
 
 # Manual endpoint to create default admin (for troubleshooting)
 @app.post("/admin/create-default-user")
@@ -600,6 +640,57 @@ def read_items(skip: int = 0, limit: int = 100, db: Session = Depends(get_db),
         )
     return crud.get_items_by_shop(db, current_user.shop_id, skip=skip, limit=limit)
 
+@app.get("/items/{item_id}", response_model=schemas.ItemResponse)
+def read_item(item_id: int, db: Session = Depends(get_db),
+              current_user: models.User = Depends(auth.require_tenant_admin_or_staff)):
+    """Get a single item for the authenticated shop"""
+    if not current_user.shop_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User is not linked to a shop"
+        )
+    item = crud.get_item_by_id(db, item_id, current_user.shop_id)
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with ID {item_id} not found"
+        )
+    return item
+
+@app.put("/items/{item_id}", response_model=schemas.ItemResponse)
+def update_item(item_id: int, item: schemas.ItemCreate, db: Session = Depends(get_db),
+                current_user: models.User = Depends(auth.require_tenant_admin_or_staff)):
+    """Update an item for the authenticated shop"""
+    if not current_user.shop_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User is not linked to a shop"
+        )
+    updated_item = crud.update_item(db, item_id, item, current_user.shop_id)
+    if not updated_item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with ID {item_id} not found"
+        )
+    return updated_item
+
+@app.delete("/items/{item_id}")
+def delete_item(item_id: int, db: Session = Depends(get_db),
+                current_user: models.User = Depends(auth.require_tenant_admin_or_staff)):
+    """Delete an item for the authenticated shop"""
+    if not current_user.shop_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User is not linked to a shop"
+        )
+    deleted_item = crud.delete_item(db, item_id, current_user.shop_id)
+    if not deleted_item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with ID {item_id} not found"
+        )
+    return {"message": f"Item '{deleted_item.name}' deleted successfully", "deleted_item_id": item_id}
+
 @app.post("/inventory/decant/{item_id}", response_model=schemas.ItemResponse)
 def decant_inventory(item_id: int, db: Session = Depends(get_db), 
                      current_user: models.User = Depends(auth.require_tenant_admin_or_staff)):
@@ -637,6 +728,46 @@ def read_ledger(phone: str, db: Session = Depends(get_db),
     return crud.get_ledger(db, phone, shop_id=current_user.shop_id)
 
 # Shop Onboarding Endpoints
+@app.get("/shops/check-name/{shop_name}")
+def check_shop_name(shop_name: str, db: Session = Depends(get_db)):
+    """Check if a shop name is available (public endpoint for validation)"""
+    shop_name_lower = shop_name.strip().lower()
+    existing_shops = db.query(models.Shop).filter(
+        func.lower(models.Shop.shop_name) == shop_name_lower
+    ).all()
+    
+    if existing_shops:
+        return {
+            "available": False,
+            "message": f"A shop with the name '{shop_name.strip()}' already exists.",
+            "existing_shops_count": len(existing_shops)
+        }
+    else:
+        return {
+            "available": True,
+            "message": f"The shop name '{shop_name.strip()}' is available."
+        }
+
+@app.get("/shops/debug/list-names")
+def debug_list_shop_names(db: Session = Depends(get_db)):
+    """Debug endpoint: List all shop names in database (for troubleshooting)"""
+    all_shops = db.query(models.Shop).all()
+    shop_names = []
+    for shop in all_shops:
+        shop_names.append({
+            "id": shop.id,
+            "shop_name": shop.shop_name,
+            "shop_code": shop.shop_code,
+            "is_active": shop.is_active,
+            "shop_name_lower": shop.shop_name.lower() if shop.shop_name else None,
+            "shop_name_length": len(shop.shop_name) if shop.shop_name else 0
+        })
+    return {
+        "total_shops": len(all_shops),
+        "active_shops": len([s for s in all_shops if s.is_active == True]),
+        "shops": shop_names
+    }
+
 @app.post("/shops/onboard", response_model=schemas.ShopOnboardResponse)
 def onboard_shop(onboard_request: schemas.ShopOnboardRequest, db: Session = Depends(get_db)):
     """
@@ -657,36 +788,12 @@ def onboard_shop(onboard_request: schemas.ShopOnboardRequest, db: Session = Depe
     - API key: X-API-Key header
     """
     try:
+        print(f"[SHOP] Onboarding shop: {onboard_request.shop.shop_name}")
         shop, owner = crud.create_shop_with_owner(db, onboard_request.shop, onboard_request.owner)
-        
-        # Get state information if state_id exists
-        state_name = None
-        state_code = None
-        if shop.state_id:
-            state_obj = crud.get_state_by_id(db, shop.state_id)
-            if state_obj:
-                state_name = state_obj.name
-                state_code = state_obj.code
+        print(f"[SHOP] Shop created successfully: {shop.shop_code}")
         
         return schemas.ShopOnboardResponse(
-            shop=schemas.ShopResponse(
-                id=shop.id,
-                shop_name=shop.shop_name,
-                shop_code=shop.shop_code,
-                api_key=shop.api_key,
-                address=shop.address,
-                city=shop.city,
-                state_id=shop.state_id,
-                state=shop.state,  # Deprecated
-                state_name=state_name,
-                state_code=state_code,
-                pincode=shop.pincode,
-                gst_number=shop.gst_number,
-                phone=shop.phone,
-                email=shop.email,
-                is_active=shop.is_active,
-                created_at=shop.created_at
-            ),
+            shop=build_shop_response(db, shop),
             owner=schemas.OwnerResponse(
                 id=owner.id,
                 shop_id=owner.shop_id,
@@ -698,16 +805,19 @@ def onboard_shop(onboard_request: schemas.ShopOnboardRequest, db: Session = Depe
                 address=owner.address,
                 created_at=owner.created_at
             ),
+            shop_id=shop.id,  # Explicitly include shop_id in response
             message=f"Shop onboarded successfully. Please save your API key securely. You can also login as a user with username: {shop.shop_code} and your shop password."
         )
-    except HTTPException:
+    except HTTPException as e:
+        # Log HTTP exceptions for debugging
+        print(f"[SHOP] Onboarding failed (HTTP {e.status_code}): {e.detail}")
         # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
         # Log the full error for debugging
         import traceback
         error_detail = str(e)
-        print(f"Error onboarding shop: {error_detail}")
+        print(f"[SHOP] Error onboarding shop: {error_detail}")
         print(traceback.format_exc())
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -717,34 +827,7 @@ def onboard_shop(onboard_request: schemas.ShopOnboardRequest, db: Session = Depe
 @app.get("/shops/me", response_model=schemas.ShopResponse)
 def get_shop_info(current_shop: models.Shop = Depends(auth.verify_api_key), db: Session = Depends(get_db)):
     """Get current shop information using API key"""
-    # Get state information if state_id exists
-    state_name = None
-    state_code = None
-    if current_shop.state_id:
-        state_obj = crud.get_state_by_id(db, current_shop.state_id)
-        if state_obj:
-            state_name = state_obj.name
-            state_code = state_obj.code
-    
-    # Create response with state information
-    return schemas.ShopResponse(
-        id=current_shop.id,
-        shop_name=current_shop.shop_name,
-        shop_code=current_shop.shop_code,
-        api_key=current_shop.api_key,
-        address=current_shop.address,
-        city=current_shop.city,
-        state_id=current_shop.state_id,
-        state=current_shop.state,  # Deprecated
-        state_name=state_name,
-        state_code=state_code,
-        pincode=current_shop.pincode,
-        gst_number=current_shop.gst_number,
-        phone=current_shop.phone,
-        email=current_shop.email,
-        is_active=current_shop.is_active,
-        created_at=current_shop.created_at
-    )
+    return build_shop_response(db, current_shop)
 
 @app.get("/shops/{shop_id}/owner", response_model=schemas.OwnerResponse)
 def get_shop_owner(shop_id: int, db: Session = Depends(get_db), current_shop: models.Shop = Depends(auth.verify_api_key)):
@@ -774,50 +857,136 @@ def shop_login(login_data: ShopLoginRequest, db: Session = Depends(get_db)):
     """
     Login for shops using shop_code and password.
     Returns shop information including API key.
+    
+    Note: If shop_name is provided instead of shop_code and multiple shops exist with that name,
+    login will fail. Always use shop_code for login.
     """
-    shop = auth.authenticate_shop(db, login_data.shop_code, login_data.password)
+    # Check if shop exists (without is_active filter to check status separately)
+    shop = db.query(models.Shop).filter(models.Shop.shop_code == login_data.shop_code).first()
+    
+    # If not found by shop_code, check if they're trying to use shop_name (not recommended)
     if not shop:
+        # Check if there are shops with this name (user might be confused)
+        shops_with_name = db.query(models.Shop).filter(models.Shop.shop_name == login_data.shop_code).all()
+        if shops_with_name:
+            if len(shops_with_name) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Multiple shops found with name '{login_data.shop_code}'. Please use your unique shop_code to login, not the shop name. Contact support if you need help finding your shop_code."
+                )
+            else:
+                # Only one shop with this name, but they used name instead of code
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Please use your shop_code to login, not the shop name. Your shop_code is: {shops_with_name[0].shop_code}"
+                )
+        
+        print(f"[SHOP] Login failed: Shop code '{login_data.shop_code}' not found")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid shop code or password"
         )
     
-    # Get state information if state_id exists
-    state_name = None
-    state_code = None
-    if shop.state_id:
-        state_obj = crud.get_state_by_id(db, shop.state_id)
-        if state_obj:
-            state_name = state_obj.name
-            state_code = state_obj.code
+    # Check if shop is active
+    if not shop.is_active:
+        print(f"[SHOP] Login failed: Shop '{login_data.shop_code}' is inactive")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Shop account is inactive. Please contact support."
+        )
     
-    # Create response with state information
-    return schemas.ShopResponse(
-        id=shop.id,
-        shop_name=shop.shop_name,
-        shop_code=shop.shop_code,
-        api_key=shop.api_key,
-        address=shop.address,
-        city=shop.city,
-        state_id=shop.state_id,
-        state=shop.state,  # Deprecated
-        state_name=state_name,
-        state_code=state_code,
-        pincode=shop.pincode,
-        gst_number=shop.gst_number,
-        phone=shop.phone,
-        email=shop.email,
-        is_active=shop.is_active,
-        created_at=shop.created_at
-    )
+    # Verify password
+    password_valid = auth.verify_password(login_data.password, shop.hashed_password)
+    if not password_valid:
+        print(f"[SHOP] Login failed: Invalid password for shop '{login_data.shop_code}'")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid shop code or password"
+        )
+    
+    print(f"[SHOP] Login successful: {login_data.shop_code}")
+    
+    return build_shop_response(db, shop)
 
 # Root Admin Endpoints (Internal API)
+@app.post("/admin/shops", response_model=schemas.ShopOnboardResponse)
+def admin_create_shop(onboard_request: schemas.ShopOnboardRequest, db: Session = Depends(get_db),
+                      current_user: models.User = Depends(auth.require_root_admin)):
+    """Create a main store or branch with owner - Root admin only"""
+    shop, owner = crud.create_shop_with_owner(db, onboard_request.shop, onboard_request.owner)
+    return schemas.ShopOnboardResponse(
+        shop=build_shop_response(db, shop),
+        owner=schemas.OwnerResponse(
+            id=owner.id,
+            shop_id=owner.shop_id,
+            owner_name=owner.owner_name,
+            phone=owner.phone,
+            email=owner.email,
+            aadhaar_number=owner.aadhaar_number,
+            pan_number=owner.pan_number,
+            address=owner.address,
+            created_at=owner.created_at,
+        ),
+        shop_id=shop.id,
+        message="Shop created successfully.",
+    )
+
 @app.get("/admin/shops", response_model=list[schemas.ShopResponse])
 def list_all_shops(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), 
                    current_user: models.User = Depends(auth.require_root_admin)):
     """List all shops - Root admin only"""
     shops = crud.get_all_shops(db, skip=skip, limit=limit)
-    return shops
+    return [build_shop_response(db, shop) for shop in shops]
+
+@app.get("/admin/shops/{shop_id}/children", response_model=list[schemas.ShopResponse])
+def list_child_shops(shop_id: int, skip: int = 0, limit: int = 100, db: Session = Depends(get_db),
+                     current_user: models.User = Depends(auth.require_root_admin)):
+    """List branch stores under a parent store - Root admin only"""
+    children = crud.get_child_shops(db, shop_id, skip=skip, limit=limit)
+    return [build_shop_response(db, shop) for shop in children]
+
+@app.put("/admin/shops/{shop_id}", response_model=schemas.ShopResponse)
+def admin_update_shop(shop_id: int, payload: schemas.ShopAdminUpdate, db: Session = Depends(get_db),
+                      current_user: models.User = Depends(auth.require_root_admin)):
+    """Update store details - Root admin only"""
+    updated_shop = crud.update_shop_admin(db, shop_id, payload)
+    if not updated_shop:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Shop with ID {shop_id} not found")
+    return build_shop_response(db, updated_shop)
+
+@app.get("/admin/shops/{shop_id}/owner", response_model=schemas.OwnerResponse)
+def admin_get_shop_owner(shop_id: int, db: Session = Depends(get_db),
+                         current_user: models.User = Depends(auth.require_root_admin)):
+    """Get owner of a shop - Root admin only"""
+    owner = crud.get_owner_by_shop_id(db, shop_id)
+    if not owner:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Owner not found")
+    return owner
+
+@app.put("/admin/shops/{shop_id}/owner", response_model=schemas.OwnerResponse)
+def admin_upsert_shop_owner(shop_id: int, owner_payload: schemas.OwnerBase, db: Session = Depends(get_db),
+                            current_user: models.User = Depends(auth.require_root_admin)):
+    """Assign or update owner for a shop - Root admin only"""
+    shop = crud.get_shop_by_id(db, shop_id)
+    if not shop:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Shop with ID {shop_id} not found")
+    owner = crud.upsert_owner_for_shop(db, shop_id, owner_payload)
+    return owner
+
+@app.delete("/admin/shops/{shop_id}")
+def delete_shop(shop_id: int, db: Session = Depends(get_db),
+                current_user: models.User = Depends(auth.require_root_admin)):
+    """Delete a shop permanently - Root admin only"""
+    deleted_shop = crud.hard_delete_shop(db, shop_id)
+    if not deleted_shop:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Shop with ID {shop_id} not found"
+        )
+    return {
+        "message": f"Shop '{deleted_shop.shop_name}' (code: {deleted_shop.shop_code}) deleted successfully",
+        "deleted_shop_id": shop_id
+    }
 
 @app.get("/admin/users", response_model=list[schemas.UserResponse])
 def list_all_users(skip: int = 0, limit: int = 100, db: Session = Depends(get_db),
@@ -867,8 +1036,35 @@ def get_customer(customer_id: int, db: Session = Depends(get_db),
         )
     return customer
 
-# State Management Endpoints
-@app.post("/states/", response_model=schemas.StateResponse)
+@app.put("/customers/{customer_id}", response_model=schemas.CustomerResponse)
+def update_customer(customer_id: int, customer: schemas.CustomerCreate, db: Session = Depends(get_db),
+                    current_user: models.User = Depends(auth.require_tenant_admin_or_staff)):
+    """Update a customer for the authenticated shop"""
+    updated_customer = crud.update_customer(db, customer_id, customer, current_user.shop_id)
+    if not updated_customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer not found"
+        )
+    return updated_customer
+
+@app.delete("/customers/{customer_id}")
+def delete_customer(customer_id: int, db: Session = Depends(get_db),
+                    current_user: models.User = Depends(auth.require_tenant_admin_or_staff)):
+    """Soft delete a customer for the authenticated shop"""
+    deleted_customer = crud.delete_customer(db, customer_id, current_user.shop_id)
+    if not deleted_customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer not found"
+        )
+    return {
+        "message": f"Customer '{deleted_customer.customer_name}' deleted successfully",
+        "deleted_customer_id": customer_id
+    }
+
+# State Management Endpoints (POST /states without trailing slash to avoid 307 redirect dropping body)
+@app.post("/states", response_model=schemas.StateResponse)
 def create_state(state: schemas.StateCreate, db: Session = Depends(get_db),
                  current_user: models.User = Depends(auth.require_root_admin)):
     """Create a new state - Root admin only"""
@@ -926,3 +1122,18 @@ def update_state(state_id: int, state: schemas.StateCreate, db: Session = Depend
             detail="State not found"
         )
     return updated_state
+
+@app.delete("/states/{state_id}")
+def delete_state(state_id: int, db: Session = Depends(get_db),
+                 current_user: models.User = Depends(auth.require_root_admin)):
+    """Soft delete a state - Root admin only"""
+    deleted_state = crud.delete_state(db, state_id)
+    if not deleted_state:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="State not found"
+        )
+    return {
+        "message": f"State '{deleted_state.name}' marked as inactive",
+        "deleted_state_id": state_id
+    }

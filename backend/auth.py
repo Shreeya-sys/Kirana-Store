@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from fastapi import Depends, HTTPException, status, Header, Security
+from fastapi import Depends, HTTPException, status, Header, Security, Request
 from fastapi.security import OAuth2PasswordBearer, APIKeyHeader
 from sqlalchemy.orm import Session
 import hashlib
@@ -113,23 +113,68 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(database.SessionLocal)): # Adjusted dependency for simplicity in this context, ideally use get_db
+def get_db():
+    """Database dependency - creates and closes session"""
+    db = database.SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_token_from_header_or_query(
+    request: Request,
+    token_from_header: Optional[str] = Depends(oauth2_scheme),
+) -> Optional[str]:
+    """Get JWT token from Authorization header OR from query param 'local_kw' (fallback)."""
+    if token_from_header:
+        return token_from_header
+    local_kw = request.query_params.get("local_kw")
+    if not local_kw or not local_kw.strip():
+        return None
+    local_kw = local_kw.strip()
+    if local_kw.lower().startswith("bearer "):
+        return local_kw[7:].strip()
+    return local_kw
+
+def get_current_user(
+    token: Optional[str] = Depends(get_token_from_header_or_query),
+    db: Session = Depends(get_db),
+):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    # Check if token is provided
+    if not token:
+        print("[AUTH] Failed: No token provided (use Authorization: Bearer <token> or query param local_kw)")
+        raise credentials_exception
+    
+    print(f"[AUTH] Validating token: {token[:20]}... (first 20 chars)")
+    
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
+        role: str = payload.get("role")
+        print(f"   Token decoded successfully - Username: {username}, Role: {role}")
+        
         if username is None:
+            print("[AUTH] Failed: Token missing 'sub' (username) field")
             raise credentials_exception
-        token_data = schemas.TokenData(username=username, role=payload.get("role"))
-    except JWTError:
+        
+        token_data = schemas.TokenData(username=username, role=role)
+    except JWTError as e:
+        print(f"[AUTH] Failed: JWT decode error - {str(e)}")
+        print(f"   Token might be expired, invalid, or malformed")
         raise credentials_exception
+    
     user = crud.get_user_by_username(db, username=token_data.username)
     if user is None:
+        print(f"[AUTH] Failed: User '{token_data.username}' not found in database")
+        print(f"   Token was valid but user doesn't exist")
         raise credentials_exception
+    
+    print(f"[AUTH] Success: User '{user.username}' (ID: {user.id}, Role: {user.role}, Shop ID: {user.shop_id})")
     return user
 
 def get_current_active_user(current_user: models.User = Depends(get_current_user)):
@@ -137,7 +182,10 @@ def get_current_active_user(current_user: models.User = Depends(get_current_user
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
 
-def get_current_user_optional(token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(database.SessionLocal)) -> Optional[models.User]:
+def get_current_user_optional(
+    token: Optional[str] = Depends(get_token_from_header_or_query),
+    db: Session = Depends(get_db),
+) -> Optional[models.User]:
     """Get current user if authenticated, otherwise return None (for optional auth endpoints)"""
     if not token:
         return None
@@ -164,15 +212,18 @@ def require_root_admin(current_user: models.User = Depends(get_current_active_us
 def require_tenant_admin(current_user: models.User = Depends(get_current_active_user)):
     """Require tenant_admin role - can manage their own shop"""
     if current_user.role != "tenant_admin":
+        print(f"[AUTH] Access denied: User '{current_user.username}' has role '{current_user.role}', but 'tenant_admin' is required")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Tenant admin access required"
+            detail=f"Tenant admin access required. Current role: {current_user.role}. Please login with a tenant_admin account."
         )
     if not current_user.shop_id:
+        print(f"[AUTH] Access denied: User '{current_user.username}' is not linked to a shop (shop_id is None)")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="User is not linked to a shop"
+            detail="User is not linked to a shop. Please ensure your account is associated with a shop."
         )
+    print(f"[AUTH] Tenant admin access granted: User '{current_user.username}' (shop_id: {current_user.shop_id})")
     return current_user
 
 def require_tenant_admin_or_staff(current_user: models.User = Depends(get_current_active_user)):

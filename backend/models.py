@@ -128,6 +128,8 @@ class Shop(Base):
     hashed_password = Column(Text, nullable=False)  # Password for shop authentication
     address = Column(Text, nullable=True)
     city = Column(String, nullable=True)
+    parent_shop_id = Column(Integer, ForeignKey("shops.id"), nullable=True, index=True)  # Hierarchy support
+    store_type = Column(String, nullable=False, default="main")  # main or branch
     state_id = Column(Integer, ForeignKey("states.id"), nullable=True, index=True)  # Foreign key to State
     state = Column(String, nullable=True)  # Deprecated: kept for backward compatibility during migration
     pincode = Column(String, nullable=True)
@@ -141,6 +143,7 @@ class Shop(Base):
     
     # Relationships
     state_rel = relationship("State", back_populates="shops")
+    parent_shop = relationship("Shop", remote_side=[id], backref="branches")
     owner = relationship("Owner", back_populates="shop", uselist=False)
     users = relationship("User", back_populates="shop")
     customers = relationship("Customer", back_populates="shop")

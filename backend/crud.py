@@ -1,6 +1,11 @@
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from datetime import datetime
 import models, schemas, auth
+
+def _schema_to_dict(obj):
+    """Pydantic v1 uses .dict(), v2 uses .model_dump()"""
+    return getattr(obj, "model_dump", getattr(obj, "dict"))()
 
 def get_user(db: Session, user_id: int):
     return db.query(models.User).filter(models.User.id == user_id).first()
@@ -36,7 +41,7 @@ def authenticate_user(db: Session, username: str, password: str):
     return user
 
 def create_item(db: Session, item: schemas.ItemCreate, shop_id: int = None):
-    db_item = models.Item(**item.dict())
+    db_item = models.Item(**_schema_to_dict(item))
     if shop_id:
         db_item.shop_id = shop_id
     db.add(db_item)
@@ -55,6 +60,33 @@ def get_items_by_shop(db: Session, shop_id: int, skip: int = 0, limit: int = 100
     return db.query(models.Item).filter(
         models.Item.shop_id == shop_id
     ).offset(skip).limit(limit).all()
+
+def get_item_by_id(db: Session, item_id: int, shop_id: int):
+    """Get an item by ID (must belong to shop)"""
+    return db.query(models.Item).filter(
+        models.Item.id == item_id,
+        models.Item.shop_id == shop_id
+    ).first()
+
+def update_item(db: Session, item_id: int, item_data: schemas.ItemCreate, shop_id: int):
+    """Update an item for a shop"""
+    db_item = get_item_by_id(db, item_id, shop_id)
+    if not db_item:
+        return None
+    for key, value in _schema_to_dict(item_data).items():
+        setattr(db_item, key, value)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+def delete_item(db: Session, item_id: int, shop_id: int):
+    """Delete an item for a shop"""
+    db_item = get_item_by_id(db, item_id, shop_id)
+    if not db_item:
+        return None
+    db.delete(db_item)
+    db.commit()
+    return db_item
 
 def decant_stock(db: Session, item_id: int, shop_id: int = None):
     query = db.query(models.Item).filter(models.Item.id == item_id)
@@ -161,8 +193,23 @@ def create_shop_with_owner(db: Session, shop_data: schemas.ShopBase, owner_data:
     from fastapi import HTTPException, status
     import auth
     
-    # Validate password length
-    if len(shop_data.password) < 6:
+    # Validate shop_name is not empty
+    if not shop_data.shop_name or not shop_data.shop_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Shop name is required and cannot be empty"
+        )
+    
+    # Validate owner_name is not empty
+    if not owner_data.owner_name or not owner_data.owner_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Owner name is required and cannot be empty"
+        )
+    
+    # Validate password length (or apply default for admin-created stores)
+    password_value = shop_data.password or "changeme123"
+    if len(password_value) < 6:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Password must be at least 6 characters long"
@@ -170,12 +217,93 @@ def create_shop_with_owner(db: Session, shop_data: schemas.ShopBase, owner_data:
     
     # Hash the password
     try:
-        hashed_password = auth.get_password_hash(shop_data.password)
+        hashed_password = auth.get_password_hash(password_value)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Password hashing failed: {str(e)}"
         )
+    
+    # Trim and validate shop name
+    shop_name_trimmed = shop_data.shop_name.strip()
+    if not shop_name_trimmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Shop name cannot be empty or only whitespace"
+        )
+    
+    # Check for duplicate shop names (case-insensitive, only active shops)
+    shop_name_lower = shop_name_trimmed.lower()
+    
+    # Ensure we have a valid shop name to compare
+    if not shop_name_lower or len(shop_name_lower) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Shop name cannot be empty after trimming"
+        )
+    
+    # Query active shops and compare in Python (more reliable)
+    # Filter: is_active must be explicitly True (not None, not False)
+    # Get all shops first, then filter in Python to avoid SQLAlchemy issues
+    all_shops = db.query(models.Shop).all()
+    all_active_shops = [
+        shop for shop in all_shops 
+        if shop.is_active == True 
+        and shop.shop_name 
+        and shop.shop_name.strip()
+    ]
+    
+    # Compare in Python - check if any active shop has the same name (case-insensitive)
+    existing_shops_with_same_name = []
+    print(f"[SHOP] Checking duplicate for shop name: '{shop_name_trimmed}' (lowercase: '{shop_name_lower}')")
+    print(f"   Found {len(all_active_shops)} active shops in database")
+    
+    # Debug: List all existing shop names
+    if all_active_shops:
+        print(f"   Existing shop names in DB:")
+        for idx, shop in enumerate(all_active_shops, 1):
+            shop_name_display = shop.shop_name.strip() if shop.shop_name else "(None)"
+            print(f"      {idx}. '{shop_name_display}' (ID: {shop.id}, Code: {shop.shop_code}, Active: {shop.is_active})")
+    
+    # Only check shops that have a non-empty shop_name
+    # Since we already filtered in Python, all shops should have valid names
+    for shop in all_active_shops:
+        # Double-check that shop_name exists and is not empty
+        if not shop.shop_name or not shop.shop_name.strip():
+            print(f"   [WARN] Skipping shop ID {shop.id} - has empty shop_name")
+            continue
+            
+        existing_name_trimmed = shop.shop_name.strip()
+        existing_name_lower = existing_name_trimmed.lower()
+        
+        # Ensure both names are non-empty before comparing
+        if not existing_name_lower or not shop_name_lower:
+            print("   [WARN] Skipping comparison - one name is empty")
+            continue
+        
+        # Debug comparison - show exact values
+        print(f"   Comparing: '{shop_name_trimmed}' (lower: '{shop_name_lower}') vs '{existing_name_trimmed}' (lower: '{existing_name_lower}')")
+        print(f"      Lengths: new={len(shop_name_lower)}, existing={len(existing_name_lower)}")
+        print(f"      Are they equal? {existing_name_lower == shop_name_lower}")
+        
+        # Strict equality check - must be exactly the same (case-insensitive)
+        # Use == for exact string comparison
+        if existing_name_lower == shop_name_lower:
+            print(f"   [WARN] MATCH FOUND: '{existing_name_trimmed}' matches '{shop_name_trimmed}'")
+            existing_shops_with_same_name.append(shop)
+        else:
+            print("   [OK] No match - names are different")
+    
+    if existing_shops_with_same_name:
+        print(f"[SHOP] Duplicate found: {len(existing_shops_with_same_name)} shop(s) with name '{shop_name_trimmed}'")
+        existing_shop_codes = [s.shop_code for s in existing_shops_with_same_name]
+        existing_shop_ids = [s.id for s in existing_shops_with_same_name]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"A shop with the name '{shop_name_trimmed}' already exists (Shop IDs: {', '.join(map(str, existing_shop_ids))}, Shop Codes: {', '.join(existing_shop_codes)}). Please use a different shop name, or if you're testing, you can delete the existing shop using DELETE /admin/shops/{existing_shops_with_same_name[0].id} (root admin only)."
+        )
+    else:
+        print(f"[SHOP] No duplicates found for '{shop_name_trimmed}' - proceeding with creation")
     
     # Generate unique shop_code and api_key
     shop_code = auth.generate_shop_code(shop_data.shop_name)
@@ -231,14 +359,16 @@ def create_shop_with_owner(db: Session, shop_data: schemas.ShopBase, owner_data:
         if state_obj:
             state_id = state_obj.id
     
-    # Create shop
+    # Create shop (use trimmed name)
     db_shop = models.Shop(
-        shop_name=shop_data.shop_name,
+        shop_name=shop_name_trimmed,
         shop_code=shop_code,
         api_key=api_key,
         hashed_password=hashed_password,
         address=shop_data.address,
         city=shop_data.city,
+        parent_shop_id=shop_data.parent_shop_id,
+        store_type=shop_data.store_type or "main",
         state_id=state_id,
         state=state_name,  # Keep for backward compatibility
         pincode=shop_data.pincode,
@@ -283,7 +413,7 @@ def create_shop_with_owner(db: Session, shop_data: schemas.ShopBase, owner_data:
             # This allows immediate login via /token endpoint after onboarding
             user_data = schemas.UserCreate(
                 username=shop_code,
-                password=shop_data.password,  # Same password as shop for unified auth
+                password=password_value,  # Same password as shop for unified auth
                 role="tenant_admin"  # Shop owner gets tenant_admin role (manages their shop)
             )
             db_user = create_user(db, user_data)
@@ -316,6 +446,103 @@ def get_owner_by_shop_id(db: Session, shop_id: int):
     """Get owner by shop_id"""
     return db.query(models.Owner).filter(models.Owner.shop_id == shop_id).first()
 
+def get_child_shops(db: Session, parent_shop_id: int, skip: int = 0, limit: int = 100):
+    """Get child shops for a parent shop"""
+    return db.query(models.Shop).filter(
+        models.Shop.parent_shop_id == parent_shop_id
+    ).offset(skip).limit(limit).all()
+
+def update_shop_admin(db: Session, shop_id: int, shop_data: schemas.ShopAdminUpdate):
+    """Update shop details as root admin"""
+    db_shop = get_shop_by_id(db, shop_id)
+    if not db_shop:
+        return None
+
+    payload = _schema_to_dict(shop_data)
+    for key, value in payload.items():
+        if value is None:
+            continue
+        if key == "password":
+            db_shop.hashed_password = auth.get_password_hash(value)
+        elif key == "shop_name":
+            db_shop.shop_name = value.strip() if isinstance(value, str) else value
+        else:
+            setattr(db_shop, key, value)
+
+    db_shop.updated_at = datetime.utcnow().isoformat()
+    db.commit()
+    db.refresh(db_shop)
+    return db_shop
+
+def soft_delete_shop(db: Session, shop_id: int):
+    """Soft delete shop and deactivate linked users"""
+    db_shop = get_shop_by_id(db, shop_id)
+    if not db_shop:
+        return None
+    db_shop.is_active = False
+    db_shop.updated_at = datetime.utcnow().isoformat()
+    users = db.query(models.User).filter(models.User.shop_id == shop_id).all()
+    for user in users:
+        user.is_active = False
+    db.commit()
+    db.refresh(db_shop)
+    return db_shop
+
+def hard_delete_shop(db: Session, shop_id: int):
+    """Hard delete a shop and related records."""
+    db_shop = get_shop_by_id(db, shop_id)
+    if not db_shop:
+        return None
+
+    # Prevent deleting a parent that still has branches.
+    child_count = db.query(models.Shop).filter(models.Shop.parent_shop_id == shop_id).count()
+    if child_count > 0:
+        from fastapi import HTTPException, status
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot delete this store because it has {child_count} sub-store(s). Delete sub-stores first."
+        )
+
+    db.query(models.StockAdjustment).filter(models.StockAdjustment.shop_id == shop_id).delete()
+    db.query(models.InvoiceItem).filter(models.InvoiceItem.shop_id == shop_id).delete()
+    db.query(models.Invoice).filter(models.Invoice.shop_id == shop_id).delete()
+    db.query(models.Ledger).filter(models.Ledger.shop_id == shop_id).delete()
+    db.query(models.Item).filter(models.Item.shop_id == shop_id).delete()
+    db.query(models.Customer).filter(models.Customer.shop_id == shop_id).delete()
+    db.query(models.User).filter(models.User.shop_id == shop_id).delete()
+    db.query(models.Owner).filter(models.Owner.shop_id == shop_id).delete()
+    db.delete(db_shop)
+    db.commit()
+    return db_shop
+
+def upsert_owner_for_shop(db: Session, shop_id: int, owner_data: schemas.OwnerBase):
+    """Create or update owner for a shop"""
+    db_owner = get_owner_by_shop_id(db, shop_id)
+    if db_owner is None:
+        db_owner = models.Owner(
+            shop_id=shop_id,
+            owner_name=owner_data.owner_name,
+            phone=owner_data.phone,
+            email=owner_data.email,
+            aadhaar_number=owner_data.aadhaar_number,
+            pan_number=owner_data.pan_number,
+            address=owner_data.address,
+            created_at=datetime.utcnow().isoformat(),
+            updated_at=datetime.utcnow().isoformat(),
+        )
+        db.add(db_owner)
+    else:
+        db_owner.owner_name = owner_data.owner_name
+        db_owner.phone = owner_data.phone
+        db_owner.email = owner_data.email
+        db_owner.aadhaar_number = owner_data.aadhaar_number
+        db_owner.pan_number = owner_data.pan_number
+        db_owner.address = owner_data.address
+        db_owner.updated_at = datetime.utcnow().isoformat()
+    db.commit()
+    db.refresh(db_owner)
+    return db_owner
+
 # Customer CRUD operations
 def create_customer(db: Session, customer_data: schemas.CustomerCreate, shop_id: int):
     """Create a customer for a shop"""
@@ -347,6 +574,29 @@ def get_customer_by_id(db: Session, customer_id: int, shop_id: int):
         models.Customer.shop_id == shop_id
     ).first()
 
+def update_customer(db: Session, customer_id: int, customer_data: schemas.CustomerCreate, shop_id: int):
+    """Update customer details for a shop"""
+    db_customer = get_customer_by_id(db, customer_id, shop_id)
+    if not db_customer:
+        return None
+    for key, value in _schema_to_dict(customer_data).items():
+        setattr(db_customer, key, value)
+    db_customer.updated_at = datetime.utcnow().isoformat()
+    db.commit()
+    db.refresh(db_customer)
+    return db_customer
+
+def delete_customer(db: Session, customer_id: int, shop_id: int):
+    """Soft delete customer for a shop"""
+    db_customer = get_customer_by_id(db, customer_id, shop_id)
+    if not db_customer:
+        return None
+    db_customer.is_active = False
+    db_customer.updated_at = datetime.utcnow().isoformat()
+    db.commit()
+    db.refresh(db_customer)
+    return db_customer
+
 # Root Admin operations
 def get_all_shops(db: Session, skip: int = 0, limit: int = 100):
     """Get all shops (root admin only)"""
@@ -367,7 +617,7 @@ def get_shop_staff(db: Session, shop_id: int, skip: int = 0, limit: int = 100):
 # State CRUD operations
 def create_state(db: Session, state_data: schemas.StateCreate):
     """Create a new state"""
-    db_state = models.State(**state_data.dict())
+    db_state = models.State(**_schema_to_dict(state_data))
     db.add(db_state)
     db.commit()
     db.refresh(db_state)
@@ -397,8 +647,19 @@ def update_state(db: Session, state_id: int, state_data: schemas.StateCreate):
     db_state = db.query(models.State).filter(models.State.id == state_id).first()
     if not db_state:
         return None
-    for key, value in state_data.dict().items():
+    for key, value in _schema_to_dict(state_data).items():
         setattr(db_state, key, value)
+    db_state.updated_at = datetime.utcnow().isoformat()
+    db.commit()
+    db.refresh(db_state)
+    return db_state
+
+def delete_state(db: Session, state_id: int):
+    """Soft delete a state by setting is_active to False"""
+    db_state = db.query(models.State).filter(models.State.id == state_id).first()
+    if not db_state:
+        return None
+    db_state.is_active = False
     db_state.updated_at = datetime.utcnow().isoformat()
     db.commit()
     db.refresh(db_state)
